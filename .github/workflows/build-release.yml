@@ -1,0 +1,115 @@
+name: AP8220 QWRT AP - Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_url:
+        description: '固件直链'
+        required: true
+        type: string
+      firmware_sha256:
+        description: '原包 SHA256（可选）'
+        required: false
+        default: ''
+        type: string
+      wifi_mode:
+        description: '双频设置'
+        required: true
+        default: 共用
+        type: choice
+        options:
+          - 共用
+          - 分别
+      ssid_2g:
+        description: '2.4G 名称（共用时用于双频）'
+        required: true
+        default: Home-WiFi
+        type: string
+      wifi_key_2g:
+        description: '2.4G 密码'
+        required: true
+        default: '12345678'
+        type: string
+      channel_2g:
+        description: '2.4G 信道'
+        required: true
+        default: '6'
+        type: choice
+        options: ['auto', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
+      ssid_5g:
+        description: '5G 名称（分别模式）'
+        required: false
+        default: Home-WiFi-5G
+        type: string
+      wifi_key_5g:
+        description: '5G 密码（空则沿用 2.4G）'
+        required: false
+        default: ''
+        type: string
+      channel_5g:
+        description: '5G 信道'
+        required: true
+        default: '149'
+        type: choice
+        options: ['auto', '36', '40', '44', '48', '149', '153', '157', '161']
+      root_password:
+        description: 'root 密码（空则沿用原包）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ap8220-ap-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, verify and publish Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc squashfs-tools qemu-user-static shellcheck nodejs python3-venv libjson-c-dev curl patch zstd openssl
+          python3 -m venv "$RUNNER_TEMP/ap8220-venv"
+          "$RUNNER_TEMP/ap8220-venv/bin/python" -m pip install --disable-pip-version-check -r requirements-dev.txt
+          echo "$RUNNER_TEMP/ap8220-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Check project code
+        shell: bash
+        run: |
+          shellcheck -e SC1091,SC2034 files/usr/sbin/ap8220-ap files/etc/init.d/* files/etc/uci-defaults/* tools/check-device.sh
+          python3 -m unittest discover -s tests -p 'test_pipeline.py' -v
+
+      - name: Download firmware
+        env:
+          FIRMWARE_URL: ${{ inputs.firmware_url }}
+          FIRMWARE_SHA256: ${{ inputs.firmware_sha256 }}
+        run: python3 tools/download_firmware.py --output .input/firmware.bin --record .input/download.json
+
+      - name: Apply selected AP settings
+        run: python3 tools/configure_profile.py --event "$GITHUB_EVENT_PATH"
+
+      - name: Repack and verify firmware
+        run: python3 tools/build.py --input .input/firmware.bin --download-record .input/download.json --work .work/build --output dist
+
+      - name: Prepare Release assets
+        run: python3 tools/release.py prepare --dist dist --output release
+
+      - name: Upload all assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+        run: python3 tools/release.py publish --directory release
