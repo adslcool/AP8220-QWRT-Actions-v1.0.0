@@ -1,0 +1,19 @@
+#!/bin/sh
+# Applied once by OpenWrt's defaults runner, before S99librespeed-go.
+. /lib/functions.sh
+
+[ "$(uci -q get librespeed-go.config)" = 'librespeed-go' ] || exit 1
+
+# Offline installation skips postinst; create only the required service identity
+# here, preserving every existing account and the original root password.
+librespeed_gid="$(group_add_next librespeed)" || exit 1
+[ -n "$librespeed_gid" ] || exit 1
+user_exists librespeed || user_add librespeed '' "$librespeed_gid" || exit 1
+user_exists librespeed && group_exists librespeed || exit 1
+
+uci set librespeed-go.config.enabled='1' || exit 1
+uci set librespeed-go.config.listen_port='8989' || exit 1
+uci set librespeed-go.config.database_type='none' || exit 1
+uci commit librespeed-go || exit 1
+/etc/init.d/librespeed-go enable || exit 1
+exit 0

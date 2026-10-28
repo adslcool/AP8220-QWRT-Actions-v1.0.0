@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs after QWRT's DHCP and theme defaults, before network/dnsmasq start.
+/usr/sbin/ap8220-ap base || exit 1
+/etc/init.d/ap8220-ap-init enable
+/etc/init.d/ap8220-usteer-bridge enable
+/etc/init.d/usteer enable
+exit 0

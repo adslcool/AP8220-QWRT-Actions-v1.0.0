@@ -1,0 +1,2 @@
+-r requirements.txt
+# Pipeline tests use Python's standard library.

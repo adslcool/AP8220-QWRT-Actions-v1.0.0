@@ -1,0 +1,182 @@
+--- a/local_node.c
++++ b/local_node.c
+@@ -113,7 +113,7 @@
+ 	};
+ 	struct blobmsg_policy policy[__BSS_TM_QUERY_MAX] = {
+ 		[BSS_TM_QUERY_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+-		[BSS_TM_QUERY_DIALOG_TOKEN] = { .name = "dialog-token", .type = BLOBMSG_TYPE_INT8 },
++		[BSS_TM_QUERY_DIALOG_TOKEN] = { .name = "dialog-token", .type = BLOBMSG_TYPE_INT32 },
+ 		[BSS_TM_QUERY_CANDIDATE_LIST] = { .name = "candidate-list", .type = BLOBMSG_TYPE_STRING },
+ 	};
+ 	struct blob_attr *tb[__BSS_TM_QUERY_MAX];
+@@ -129,7 +129,7 @@
+ 	if (!query)
+ 		return 0;
+ 
+-	query->dialog_token = blobmsg_get_u8(tb[BSS_TM_QUERY_DIALOG_TOKEN]);
++	query->dialog_token = blobmsg_get_u32(tb[BSS_TM_QUERY_DIALOG_TOKEN]);
+ 
+ 	sta_addr = (uint8_t *) ether_aton(blobmsg_get_string(tb[BSS_TM_QUERY_ADDRESS]));
+ 	if (!sta_addr) {
+@@ -155,7 +155,7 @@
+ 	};
+ 	struct blobmsg_policy policy[__BSS_TM_RESPONSE_MAX] = {
+ 		[BSS_TM_RESPONSE_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+-		[BSS_TM_RESPONSE_STATUS_CODE] = { .name = "status-code", .type = BLOBMSG_TYPE_INT8 },
++		[BSS_TM_RESPONSE_STATUS_CODE] = { .name = "status-code", .type = BLOBMSG_TYPE_INT32 },
+ 	};
+ 	struct blob_attr *tb[__BSS_TM_RESPONSE_MAX];
+ 	struct sta_info *si;
+@@ -179,7 +179,7 @@
+ 	if (!si)
+ 		return 0;
+ 
+-	si->bss_transition_response.status_code = blobmsg_get_u8(tb[BSS_TM_RESPONSE_STATUS_CODE]);
++	si->bss_transition_response.status_code = blobmsg_get_u32(tb[BSS_TM_RESPONSE_STATUS_CODE]);
+ 	si->bss_transition_response.timestamp = current_time;
+ 
+ 	if (si->bss_transition_response.status_code && si->kick_time && si->sta->aggressiveness) {
+@@ -204,8 +204,8 @@
+ 	struct blobmsg_policy policy[__BR_MAX] = {
+ 		[BR_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+ 		[BR_BSSID] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
+-		[BR_RCPI] = { .name = "rcpi", .type = BLOBMSG_TYPE_INT16 },
+-		[BR_RSNI] = { .name = "rsni", .type = BLOBMSG_TYPE_INT16 },
++		[BR_RCPI] = { .name = "rcpi", .type = BLOBMSG_TYPE_INT32 },
++		[BR_RSNI] = { .name = "rsni", .type = BLOBMSG_TYPE_INT32 },
+ 	};
+ 	struct blob_attr *tb[__BR_MAX];
+ 	struct usteer_node *node;
+@@ -233,8 +233,8 @@
+ 		return 0;
+ 
+ 	usteer_measurement_report_add(sta, node,
+-				      (uint8_t)blobmsg_get_u16(tb[BR_RCPI]),
+-				      (uint8_t)blobmsg_get_u16(tb[BR_RSNI]),
++				      (uint8_t)blobmsg_get_u32(tb[BR_RCPI]),
++				      (uint8_t)blobmsg_get_u32(tb[BR_RSNI]),
+ 				      current_time);
+ 	return 0;
+ }
+@@ -250,8 +250,8 @@
+ 	};
+ 	struct blobmsg_policy policy[__LMR_MAX] = {
+ 		[LMR_ADDRESS] = { .name = "address", .type = BLOBMSG_TYPE_STRING },
+-		[LMR_RCPI] = { .name = "rcpi", .type = BLOBMSG_TYPE_INT16 },
+-		[LMR_RSNI] = { .name = "rsni", .type = BLOBMSG_TYPE_INT16 },
++		[LMR_RCPI] = { .name = "rcpi", .type = BLOBMSG_TYPE_INT32 },
++		[LMR_RSNI] = { .name = "rsni", .type = BLOBMSG_TYPE_INT32 },
+ 	};
+ 	struct blob_attr *tb[__LMR_MAX];
+ 	uint8_t *addr;
+@@ -473,8 +473,31 @@
+ 
+ 			h->update_sta(node, si);
+ 		}
++		/* QCA-only build: statistics originate from hostapd STA replies. */
++		{
++			static const struct blobmsg_policy p = { "signal", BLOBMSG_TYPE_INT32 };
++			struct blob_attr *signal = NULL;
++			int value = NO_SIGNAL;
++			blobmsg_parse(&p, 1, &signal, blobmsg_data(cur), blobmsg_data_len(cur));
++			if (signal) {
++				int32_t reported = (int32_t)blobmsg_get_u32(signal);
++				if (reported >= -127 && reported < 0)
++					value = reported;
++			}
++			/* Missing QCA samples must invalidate a previously cached RSSI. */
++			if (value == NO_SIGNAL)
++				si->signal = NO_SIGNAL;
++			usteer_sta_info_update(si, value, true);
++		}
+ 		usteer_local_node_assoc_update(si, cur);
+ 		if (si->connected == STA_CONNECTED) {
++			static const struct blobmsg_policy p = { "connected_time", BLOBMSG_TYPE_INT32 };
++			struct blob_attr *connected = NULL;
++			blobmsg_parse(&p, 1, &connected, blobmsg_data(cur), blobmsg_data_len(cur));
++			if (connected && blobmsg_get_u32(connected) <= current_time / 1000)
++				si->connected_since = current_time - (int64_t)blobmsg_get_u32(connected) * 1000;
++			else if (!si->connected_since)
++				si->connected_since = current_time;
+ 			si->last_connected = current_time;
+ 			n_assoc++;
+ 		}
+@@ -526,6 +549,8 @@
+ usteer_local_node_status_cb(struct ubus_request *req, int type, struct blob_attr *msg)
+ {
+ 	enum {
++		MSG_BSSID,
++		MSG_SSID,
+ 		MSG_FREQ,
+ 		MSG_CHANNEL,
+ 		MSG_OP_CLASS,
+@@ -533,6 +558,8 @@
+ 		__MSG_MAX,
+ 	};
+ 	static struct blobmsg_policy policy[__MSG_MAX] = {
++		[MSG_BSSID] = { "bssid", BLOBMSG_TYPE_STRING },
++		[MSG_SSID] = { "ssid", BLOBMSG_TYPE_STRING },
+ 		[MSG_FREQ] = { "freq", BLOBMSG_TYPE_INT32 },
+ 		[MSG_CHANNEL] = { "channel", BLOBMSG_TYPE_INT32 },
+ 		[MSG_OP_CLASS] = { "op_class", BLOBMSG_TYPE_INT32 },
+@@ -542,10 +569,18 @@
+ 	struct usteer_local_node *ln;
+ 	struct usteer_node *node;
+ 
+-	ln = container_of(req, struct usteer_local_node, req);
++	ln = req->priv ? req->priv : container_of(req, struct usteer_local_node, req);
+ 	node = &ln->node;
+ 
+ 	blobmsg_parse(policy, __MSG_MAX, tb, blob_data(msg), blob_len(msg));
++	if (tb[MSG_BSSID]) {
++		struct ether_addr addr;
++		if (ether_aton_r(blobmsg_get_string(tb[MSG_BSSID]), &addr))
++			memcpy(node->bssid, &addr, sizeof(node->bssid));
++	}
++	if (tb[MSG_SSID])
++		snprintf(node->ssid, sizeof(node->ssid), "%s", blobmsg_get_string(tb[MSG_SSID]));
++
+ 	if (tb[MSG_FREQ])
+ 		node->freq = blobmsg_get_u32(tb[MSG_FREQ]);
+ 	if (tb[MSG_CHANNEL])
+@@ -876,6 +911,9 @@
+ 		h->init_node(&ln->node);
+ 	}
+ 
++	/* Populate SSID before applying ssid_list (which can suspend updates). */
++	blob_buf_init(&b, 0);
++	ubus_invoke(ctx, id, "get_status", b.head, usteer_local_node_status_cb, ln, 1000);
+ 	ln->node.disabled = true;
+ 	usteer_check_node_enabled(ln);
+ }
+--- a/main.c
++++ b/main.c
+@@ -96,16 +96,16 @@
+ 	config.remote_update_interval = 1000;
+ 	config.initial_connect_delay = 0;
+ 	config.remote_node_timeout = 10;
+-	config.aggressiveness = 3;
++	config.aggressiveness = 1;
+ 	config.reassociation_delay = 30;
+ 
+ 	config.steer_reject_timeout = 60000;
+ 
+-	config.band_steering_interval = 30000;
++	config.band_steering_interval = 0;
+ 	config.band_steering_min_snr = -60;
+ 	config.band_steering_signal_threshold = 5;
+ 
+-	config.link_measurement_interval = 30000;
++	config.link_measurement_interval = 0;
+ 
+ 	config.probe_steering = 0;
+ 
+@@ -215,7 +215,7 @@
+ 	usteer_update_time();
+ 	uloop_init();
+ 
+-	ubus_ctx = ubus_connect(NULL);
++	ubus_ctx = ubus_connect(getenv("USTEER_UBUS_SOCKET"));
+ 	if (!ubus_ctx) {
+ 		fprintf(stderr, "Failed to connect to ubus\n");
+ 		return -1;

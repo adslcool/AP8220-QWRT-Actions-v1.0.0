@@ -1,0 +1,502 @@
+#!/bin/sh
+# shellcheck shell=dash
+# AP8220 QWRT AP profile. This configures user space only.
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+VERSION='1.0.0'
+LC_ALL=C
+export LC_ALL
+
+log() {
+	logger -t ap8220-ap -- "$*"
+	printf '%s\n' "$*" >&2
+}
+
+get_profile() {
+	local value
+	value=$(uci -q get "ap8220_ap.profile.$1")
+	printf '%s' "${value:-$2}"
+}
+
+valid_mac() {
+	printf '%s\n' "$1" | grep -Eq '^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$' || return 1
+	case "$(printf '%s' "$1" | tr 'A-F' 'a-f')" in
+		00:00:00:00:00:00|ff:ff:ff:ff:ff:ff) return 1 ;;
+	esac
+	[ $((0x${1%%:*} & 1)) -eq 0 ]
+}
+
+trusted_uboot_mac() {
+	valid_mac "$1" || return 1
+	# Reject local, multicast, and common generic bootloader addresses.
+	[ $((0x${1%%:*} & 2)) -eq 0 ] || return 1
+	case "$(printf '%s' "$1" | tr 'A-F' 'a-f')" in
+		00:11:22:33:44:55|00:03:7f:ba:db:ad|00:aa:bb:cc:dd:ee) return 1 ;;
+	esac
+}
+
+resolve_mac() {
+	local candidate serial path digest
+	MAC=''
+	MAC_SOURCE=''
+	candidate=$(get_profile base_mac '')
+	if [ -n "$candidate" ]; then
+		valid_mac "$candidate" || { log 'Invalid explicitly configured base_mac'; return 1; }
+		MAC=$candidate
+		MAC_SOURCE='manual'
+	elif candidate=$(/bin/product_info product.mac 2>/dev/null) && valid_mac "$candidate"; then
+		MAC=$candidate
+		MAC_SOURCE='product_info'
+	elif [ "$(uci -q get ap8220_ap.core.mac_verified)" = 1 ]; then
+		candidate=$(uci -q get ap8220_ap.core.base_mac)
+		valid_mac "$candidate" || return 1
+		MAC=$candidate
+		MAC_SOURCE=$(uci -q get ap8220_ap.core.mac_source)
+	elif candidate=$(fw_printenv -n ethaddr 2>/dev/null) && trusted_uboot_mac "$candidate"; then
+		MAC=$candidate
+		MAC_SOURCE='uboot_ethaddr'
+	else
+		# A serial-derived local address is stable, but is NOT a factory MAC.
+		# Never use an arbitrary current eth/br-lan address as the factory MAC.
+		for path in /sys/devices/soc0/serial_number /sys/devices/platform/soc/soc0/serial_number /proc/device-tree/serial-number; do
+			[ -r "$path" ] || continue
+			serial=$(tr -d '\000\r\n\t ' < "$path")
+			printf '%s\n' "$serial" | grep -Eq '^[0-9A-Za-z_-]{4,128}$' || continue
+			printf '%s\n' "$serial" | grep -Eiq '^(0x)?(0+|f+)$' && continue
+			digest=$(printf 'AP8220-QWRT-AP:%s' "$serial" | sha256sum)
+			digest=${digest%% *}
+			MAC=$(printf '%s' "$digest" | sed 's/^\(..\)\(..\)\(..\)\(..\)\(..\).*$/02:\1:\2:\3:\4:\5/')
+			MAC_SOURCE='soc_serial'
+			log 'Factory MAC unavailable; using a stable serial-derived local MAC'
+			break
+		done
+	fi
+	valid_mac "$MAC" || return 1
+	MAC=$(printf '%s' "$MAC" | tr 'A-F' 'a-f')
+}
+
+apply_identity() {
+	local prefix suffix
+	if ! resolve_mac; then
+		uci set ap8220_ap.core.mac_pending='1'
+		uci set ap8220_ap.core.initialized='0'
+		uci commit ap8220_ap
+		log 'No reliable MAC/serial available. Set ap8220_ap.profile.base_mac from the device label or a verified backup, then restart ap8220-ap-init.'
+		return 1
+	fi
+	prefix=$(get_profile hostname_prefix AP8220)
+	printf '%s\n' "$prefix" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]{0,39}$' || return 1
+	suffix=$(printf '%s' "$MAC" | awk -F: '{print toupper($4 $5 $6)}')
+	uci set "system.@system[0].hostname=$prefix-$suffix" || return 1
+	uci set "network.br_lan.macaddr=$MAC" || return 1
+	uci set "network.lan.macaddr=$MAC" || return 1
+	uci set "ap8220_ap.core.base_mac=$MAC"
+	uci set "ap8220_ap.core.mac_source=$MAC_SOURCE"
+	uci set ap8220_ap.core.mac_verified='1'
+	uci set ap8220_ap.core.mac_pending='0'
+	uci commit network && uci commit system && uci commit ap8220_ap
+}
+
+remove_old_bridge() {
+	local name
+	config_get name "$1" name
+	[ "$name" != br-lan ] || uci -q delete "network.$1"
+	return 0
+}
+
+find_migration_device() {
+	local name
+	config_get name "$1" name
+	[ "$name" != "$MIGRATION_DEVICE_NAME" ] || MIGRATION_DEVICE_SECTION=$1
+}
+
+migrate_legacy_interface() {
+	local type ifname device section option value port ports
+	config_get type "$1" type
+	config_get ifname "$1" ifname
+	config_get device "$1" device
+	[ -n "$ifname" ] || return 0
+	if [ "$type" = bridge ] && [ -z "$device" ]; then
+		MIGRATION_DEVICE_NAME="br-$1"
+		MIGRATION_DEVICE_SECTION=''
+		config_foreach find_migration_device device
+		section=$MIGRATION_DEVICE_SECTION
+		[ -n "$section" ] || section=$(uci add network device) || { MIGRATION_ERROR=1; return 0; }
+		uci set "network.$section.name=$MIGRATION_DEVICE_NAME" || MIGRATION_ERROR=1
+		uci set "network.$section.type=bridge" || MIGRATION_ERROR=1
+		ports=$(uci -q get "network.$section.ports")
+		if [ -z "$ports" ]; then
+			for port in $ifname; do uci add_list "network.$section.ports=$port" || MIGRATION_ERROR=1; done
+		fi
+		for option in mtu macaddr igmp_snooping; do
+			config_get value "$1" "$option"
+			if [ -n "$value" ]; then uci set "network.$section.$option=$value" || MIGRATION_ERROR=1; fi
+			uci -q delete "network.$1.$option"
+		done
+		uci set "network.$1.device=$MIGRATION_DEVICE_NAME" || MIGRATION_ERROR=1
+		uci -q delete "network.$1.type"
+	elif [ -z "$device" ]; then
+		uci set "network.$1.device=$ifname" || MIGRATION_ERROR=1
+	fi
+	uci -q delete "network.$1.ifname"
+	return 0
+}
+
+migrate_legacy_bridge_device() {
+	local type ifname ports port
+	config_get type "$1" type
+	[ "$type" = bridge ] || return 0
+	config_get ifname "$1" ifname
+	[ -n "$ifname" ] || return 0
+	config_get ports "$1" ports
+	if [ -z "$ports" ]; then
+		for port in $ifname; do uci add_list "network.$1.ports=$port" || MIGRATION_ERROR=1; done
+	fi
+	uci -q delete "network.$1.ifname"
+	return 0
+}
+
+migrate_network() {
+	[ "$(uci -q get ap8220_ap.core.network_schema)" != 2 ] || return 0
+	# QWRT's earlier OpenVPN defaults create vpn0 even when VPN is disabled.
+	uci -q delete network.vpn0
+	if uci -q get openvpn.myvpn >/dev/null; then
+		uci set openvpn.myvpn.enabled='0' && uci commit openvpn || return 1
+	fi
+	if [ -f /etc/config/firewall ]; then
+		local section
+		for section in openvpn vpn vpntowan vpntolan lantovpn; do uci -q delete "firewall.$section"; done
+		uci commit firewall || return 1
+	fi
+	if [ -f /etc/config/dhcp ]; then
+		uci -q delete dhcp.vpn0
+		uci commit dhcp || return 1
+	fi
+	MIGRATION_ERROR=0
+	config_load network
+	config_foreach migrate_legacy_interface interface
+	config_load network
+	config_foreach migrate_legacy_bridge_device device
+	[ "$MIGRATION_ERROR" -eq 0 ] || { uci revert network; return 1; }
+	uci commit network || return 1
+	uci set ap8220_ap.core.network_schema='2'
+	uci commit ap8220_ap || return 1
+	log 'Network schema migrated; default vpn0/tun0 interface removed'
+}
+
+apply_root_password() {
+	[ -f /etc/ap8220-root-password.hash ] || return 0
+	[ "$(uci -q get ap8220_ap.core.root_password_applied)" != 1 ] || return 0
+	local hash temporary count
+	IFS= read -r hash < /etc/ap8220-root-password.hash || return 1
+	printf '%s\n' "$hash" | grep -Eq '^[$]1[$][./A-Za-z0-9]{1,8}[$][./A-Za-z0-9]{22}$' || {
+		log 'Invalid custom root password hash'; return 1;
+	}
+	count=$(grep -c '^root:' /etc/shadow)
+	[ "$count" = 1 ] || { log 'Expected exactly one root shadow entry'; return 1; }
+	temporary=$(mktemp /etc/.ap8220-shadow.XXXXXX) || return 1
+	# Preserve shadow ownership/mode, every other account and all aging fields.
+	if ! cp -p /etc/shadow "$temporary" ||
+		! sed "s|^root:[^:]*:|root:$hash:|" /etc/shadow > "$temporary" ||
+		! mv -f "$temporary" /etc/shadow; then
+		rm -f "$temporary"
+		return 1
+	fi
+	uci set ap8220_ap.core.root_password_applied='1' && uci commit ap8220_ap || return 1
+	# Removes the writable copy; a factory reset restores the ROM default.
+	rm -f /etc/ap8220-root-password.hash
+	log 'Custom root password applied once'
+}
+
+disable_router_services() {
+	local service
+	for service in dnsmasq odhcpd firewall miniupnpd upnpd; do
+		[ ! -x "/etc/init.d/$service" ] || "/etc/init.d/$service" disable
+	done
+}
+
+migrate_client_defaults() {
+	if [ "$(uci -q get ap8220_ap.core.ipv6_client_schema)" != 1 ]; then
+		uci set network.lan_v6='interface' || return 1
+		uci set network.lan_v6.proto='dhcpv6'
+		uci set network.lan_v6.device='br-lan'
+		uci set network.lan_v6.reqaddress='try'
+		uci set network.lan_v6.reqprefix='no'
+		uci set network.lan_v6.delegate='0'
+		uci -q delete network.lan_v6.ifname
+		uci commit network || return 1
+		uci set ap8220_ap.core.ipv6_client_schema='1'
+	fi
+	if [ "$(uci -q get ap8220_ap.core.theme_schema)" != 1 ]; then
+		local current
+		current=$(uci -q get luci.main.mediaurlbase)
+		uci set luci.themes.Argon='/luci-static/argon'
+		uci set luci.themes.Footstrap='/luci-static/footstrap'
+		uci -q delete luci.themes.Aurora
+		case "$current" in
+			''|/luci-static/aurora) uci set luci.main.mediaurlbase='/luci-static/footstrap' ;;
+		esac
+		uci commit luci || return 1
+		uci set ap8220_ap.core.theme_schema='1'
+	fi
+	uci commit ap8220_ap
+}
+
+apply_base() {
+	uci -q get 'system.@system[0]' >/dev/null || { log 'system config is not generated yet'; return 1; }
+	uci -q get network.lan >/dev/null || { log 'network config is not generated yet'; return 1; }
+	migrate_network || return 1
+	apply_root_password || return 1
+	migrate_client_defaults || return 1
+	if [ "$(uci -q get ap8220_ap.core.base_configured)" = 1 ]; then
+		[ "$(uci -q get ap8220_ap.core.mac_pending)" != 1 ] || apply_identity
+		return 0
+	fi
+	# Remove both named and anonymous old definitions of this bridge.
+	config_load network
+	config_foreach remove_old_bridge device
+	uci -q delete network.wan
+	uci -q delete network.wan6
+	uci set network.br_lan='device' || return 1
+	uci set network.br_lan.name='br-lan'
+	uci set network.br_lan.type='bridge'
+	uci set network.br_lan.bridge_empty='1'
+	uci add_list network.br_lan.ports='eth1'
+	uci add_list network.br_lan.ports='eth0'
+	uci set network.lan='interface'
+	uci set network.lan.device='br-lan'
+	uci set network.lan.proto='dhcp'
+	uci set network.lan.delegate='0'
+	uci -q delete network.lan.type
+	uci -q delete network.lan.ifname
+	uci -q delete network.lan.ipaddr
+	uci -q delete network.lan.netmask
+	uci -q delete network.lan.gateway
+	uci -q delete network.lan.dns
+	uci -q delete network.lan.ip6assign
+	uci -q delete network.lan.ip6addr
+	uci -q delete network.lan.ip6hint
+	uci -q delete network.lan.macaddr
+	uci set dhcp.lan='dhcp'
+	uci set dhcp.lan.interface='lan'
+	uci set dhcp.lan.ignore='1'
+	uci set dhcp.lan.ra='disabled'
+	uci set dhcp.lan.dhcpv6='disabled'
+	uci set dhcp.lan.ndp='disabled'
+	uci -q delete dhcp.lan.force
+	uci set luci.main.lang='zh_cn'
+	uci set luci.main.mediaurlbase='/luci-static/footstrap'
+	uci set luci.themes.Argon='/luci-static/argon'
+	uci set luci.themes.Footstrap='/luci-static/footstrap'
+	uci set 'system.@system[0].timezone=CST-8'
+	uci set 'system.@system[0].zonename=Asia/Shanghai'
+	# Empty root-password input leaves upstream account initialization unchanged.
+	uci commit network && uci commit dhcp && uci commit luci && uci commit system || return 1
+	disable_router_services
+	apply_identity || true
+	uci set ap8220_ap.core.base_configured='1'
+	uci set ap8220_ap.core.usteer_status='experimental_qca_bridge'
+	uci set "ap8220_ap.core.initialized_source=qwrt-ap-$VERSION"
+	uci commit ap8220_ap || return 1
+	log 'Base AP profile prepared: eth1 + eth0 bridge, DHCP + lan_v6 DHCPv6, Footstrap default, Chinese LuCI'
+}
+
+count_qca_radio() {
+	local type
+	config_get type "$1" type
+	case "$type" in qcawifi|qcawificfg80211) QCA_RADIOS=$((QCA_RADIOS + 1));; esac
+}
+
+count_ready_ap() {
+	local mode radio type
+	config_get mode "$1" mode
+	[ "$mode" = ap ] || return 0
+	config_get radio "$1" device
+	config_get type "$radio" type
+	case "$type" in qcawifi|qcawificfg80211) ;; *) return 0;; esac
+	case " $READY_AP_RADIOS " in *" $radio "*) ;; *) READY_AP_RADIOS="$READY_AP_RADIOS $radio";; esac
+}
+
+wifi_ready() {
+	[ -s /etc/config/wireless ] || return 1
+	QCA_RADIOS=0
+	READY_AP_RADIOS=''
+	config_load wireless
+	config_foreach count_qca_radio wifi-device
+	config_foreach count_ready_ap wifi-iface
+	[ "$QCA_RADIOS" -ge 2 ] && [ "$(printf '%s\n' "$READY_AP_RADIOS" | awk '{print NF}')" -ge 2 ]
+}
+
+set_radio() {
+	local type hwmode band
+	config_get type "$1" type
+	case "$type" in qcawifi|qcawificfg80211) ;; *) return 0;; esac
+	config_get hwmode "$1" hwmode
+	case "$hwmode" in
+		*g|*b) band=2 ;;
+		*a|*ac) band=5 ;;
+		*) log "Unrecognized QCA radio mode: $1 / $hwmode"; RADIO_ERROR=1; return 0 ;;
+	esac
+	uci set "wireless.$1.country=$COUNTRY"
+	uci set "wireless.$1.disabled=0"
+	if [ "$band" = 2 ]; then
+		uci set "wireless.$1.channel=$CHANNEL_2G"
+		uci set "wireless.$1.htmode=HT20"
+	else
+		uci set "wireless.$1.channel=$CHANNEL_5G"
+		uci set "wireless.$1.htmode=HT80"
+	fi
+}
+
+set_ap() {
+	local mode radio type tag hwmode
+	config_get mode "$1" mode
+	[ "$mode" = ap ] || return 0
+	config_get radio "$1" device
+	config_get type "$radio" type
+	case "$type" in qcawifi|qcawificfg80211) ;; *) return 0;; esac
+	uci set "wireless.$1.network=lan"
+	uci set "wireless.$1.disabled=0"
+	config_get hwmode "$radio" hwmode
+	case "$hwmode" in
+		*g|*b) uci set "wireless.$1.ssid=$SSID_2G"; uci set "wireless.$1.key=$KEY_2G" ;;
+		*a|*ac) uci set "wireless.$1.ssid=$SSID_5G"; uci set "wireless.$1.key=$KEY_5G" ;;
+		*) RADIO_ERROR=1; return 0 ;;
+	esac
+	uci set "wireless.$1.encryption=psk-mixed"
+	uci set "wireless.$1.isolate=0"
+	uci set "wireless.$1.ieee80211r=1"
+	uci set "wireless.$1.mobility_domain=$MOBILITY_DOMAIN"
+	uci set "wireless.$1.ft_over_ds=0"
+	uci set "wireless.$1.ft_psk_generate_local=1"
+	uci set "wireless.$1.pmk_r1_push=0"
+	uci set "wireless.$1.rrm_neighbor_report=1"
+	uci set "wireless.$1.rrm_beacon_report=1"
+	uci set "wireless.$1.bss_transition=1"
+	# QSDK reads nasid directly; do not use mac80211-only aliases.
+	tag=$(printf '%s' "$MAC" | tr -d ':')
+	uci set "wireless.$1.nasid=AP8220-$tag-$1"
+	uci set "wireless.$1.r1_key_holder=$tag"
+	AP_COUNT=$((AP_COUNT + 1))
+	case " $AP_RADIOS " in *" $radio "*) ;; *) AP_RADIOS="$AP_RADIOS $radio";; esac
+}
+
+set_security_only() {
+	local mode radio type
+	config_get mode "$1" mode
+	[ "$mode" = ap ] || return 0
+	config_get radio "$1" device
+	config_get type "$radio" type
+	case "$type" in qcawifi|qcawificfg80211) ;; *) return 0;; esac
+	uci set "wireless.$1.encryption=psk-mixed" || return 1
+	SECURITY_AP_COUNT=$((SECURITY_AP_COUNT + 1))
+}
+
+apply_wifi() {
+	if [ "$(uci -q get ap8220_ap.core.wifi_configured)" = 1 ]; then
+		[ "$(uci -q get ap8220_ap.core.wifi_security_schema)" != 1 ] || return 0
+		wifi_ready || return 1
+		SECURITY_AP_COUNT=0
+		config_load wireless
+		config_foreach set_security_only wifi-iface
+		[ "$SECURITY_AP_COUNT" -ge 2 ] || { uci revert wireless; return 1; }
+		uci commit wireless || return 1
+		uci set ap8220_ap.core.wifi_security_schema='1'
+		uci commit ap8220_ap
+		return $?
+	fi
+	wifi_ready || return 1
+	apply_identity || return 1
+	WIFI_MODE=$(get_profile wifi_mode shared)
+	SSID_2G=$(get_profile ssid_2g "$(get_profile ssid Home-WiFi)")
+	KEY_2G=$(get_profile key_2g "$(get_profile key 12345678)")
+	case "$WIFI_MODE" in
+		shared) SSID_5G=$SSID_2G; KEY_5G=$KEY_2G ;;
+		separate) SSID_5G=$(get_profile ssid_5g Home-WiFi-5G); KEY_5G=$(get_profile key_5g "$KEY_2G") ;;
+		*) return 1 ;;
+	esac
+	COUNTRY=$(get_profile country CN)
+	CHANNEL_2G=$(get_profile channel_2g 6)
+	CHANNEL_5G=$(get_profile channel_5g 149)
+	MOBILITY_DOMAIN=$(get_profile mobility_domain a1b2)
+	[ "${#SSID_2G}" -ge 1 ] && [ "${#SSID_2G}" -le 32 ] || return 1
+	[ "${#SSID_5G}" -ge 1 ] && [ "${#SSID_5G}" -le 32 ] || return 1
+	[ "${#KEY_2G}" -ge 8 ] && [ "${#KEY_2G}" -le 63 ] || return 1
+	[ "${#KEY_5G}" -ge 8 ] && [ "${#KEY_5G}" -le 63 ] || return 1
+	printf '%s\n' "$COUNTRY" | grep -Eq '^[A-Z]{2}$' || return 1
+	printf '%s\n' "$MOBILITY_DOMAIN" | grep -Eq '^[0-9a-fA-F]{4}$' || return 1
+	printf '%s\n' "$CHANNEL_2G" | grep -Eq '^(auto|[1-9]|1[0-3])$' || return 1
+	case "$CHANNEL_5G" in auto|36|40|44|48|149|153|157|161) ;; *) return 1;; esac
+	RADIO_ERROR=0
+	AP_COUNT=0
+	AP_RADIOS=''
+	config_load wireless
+	config_foreach set_radio wifi-device
+	[ "$RADIO_ERROR" -eq 0 ] || { uci revert wireless; return 1; }
+	config_foreach set_ap wifi-iface
+	[ "$AP_COUNT" -ge 2 ] || { uci revert wireless; return 1; }
+	[ "$(printf '%s\n' "$AP_RADIOS" | awk '{print NF}')" -ge 2 ] || { uci revert wireless; return 1; }
+	uci commit wireless || return 1
+	uci set ap8220_ap.core.wifi_configured='1'
+	uci set ap8220_ap.core.wifi_security_schema='1'
+	uci set ap8220_ap.core.initialized='1'
+	uci set "ap8220_ap.core.profile_version=$VERSION"
+	uci commit ap8220_ap || return 1
+	log 'Wi-Fi profile saved: QCA backend, psk-mixed automatic cipher, 802.11k/v/r; usteer bridge is experimental.'
+}
+
+wait_wifi() {
+	local attempts=0 previous_digest='' digest
+	if [ "$(uci -q get ap8220_ap.core.initialized)" = 1 ] &&
+		[ "$(uci -q get ap8220_ap.core.wifi_security_schema)" = 1 ]; then return 0; fi
+	[ "$(uci -q get ap8220_ap.core.base_configured)" = 1 ] || { log 'Base AP setup is pending; reboot to retry first-boot setup'; return 1; }
+	while [ "$attempts" -lt 90 ]; do
+		if wifi_ready; then
+			digest=$(sha256sum /etc/config/wireless) || return 1
+			# Require a stable file across two polls so a partially generated
+			# second radio/interface is not mistaken for a completed config.
+			if [ "$digest" = "$previous_digest" ]; then
+				apply_wifi || return 1
+				# This firmware's QCA network init uses reload_legacy.
+				/sbin/wifi reload_legacy '' network_reload_legacy
+				return $?
+			fi
+			previous_digest=$digest
+		else
+			previous_digest=''
+		fi
+		attempts=$((attempts + 1))
+		sleep 2
+	done
+	log 'QCA wireless config did not become ready within 180 seconds; next boot will retry'
+	return 1
+}
+
+status() {
+	printf 'AP8220 QWRT AP %s\n' "$VERSION"
+	uci -q show ap8220_ap.core
+	uci -q get 'system.@system[0].hostname'
+	uci -q get network.br_lan.ports
+	uci -q get network.lan.proto
+	uci -q get luci.main.mediaurlbase
+}
+
+case "${1:-status}" in
+	status) status; exit $? ;;
+	base|identity|wifi|wait-wifi) ;;
+	*) printf 'Usage: ap8220-ap {status|base|identity|wifi|wait-wifi}\n' >&2; exit 2 ;;
+esac
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = 'aliyun,ap8220' ] || {
+	log 'This AP profile supports aliyun,ap8220 only'
+	exit 1
+}
+mkdir -p /var/lock
+exec 9>/var/lock/ap8220-ap.lock
+flock -n 9 || exit 0
+case "$1" in
+	base) apply_base ;;
+	identity) apply_identity ;;
+	wifi) apply_wifi ;;
+	wait-wifi) wait_wifi ;;
+esac
